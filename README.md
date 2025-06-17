@@ -1,6 +1,8 @@
 # AnnoFrog
-
-[![AnnoFrog logo](./assets/Annofrog-nobg.png)] 
+<a href="https://github.com/niklasries/AnnoFrog"> <!-- Optional: Link the image -->
+  <img src="./assets/Annofrog-nobg.png" alt="AnnoFrog Logo" width="200"/> 
+  <!-- Adjust width="200" to your desired pixel width. Height will scale proportionally. -->
+</a>
 
 
 A GUI desktop application for semi-automated 2D human pose annotation in videos, using bounding box and keypoint labeling, AI-assisted suggestions (RTMO), and interpolation tools. Built with Python, PyQt6, and OpenGL.
