@@ -1,0 +1,8 @@
+PyQt6
+PyOpenGL
+PyOpenGL_accelerate
+numpy
+onnxruntime-gpu
+opencv-contrib-python
+opencv-python
+tqdm
