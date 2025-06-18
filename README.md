@@ -7,6 +7,10 @@
 
 A GUI desktop application for semi-automated 2D human pose annotation in videos, using bounding box and keypoint labeling, AI-assisted suggestions (RTMO), and interpolation tools. Built with Python, PyQt6, and OpenGL.
 
+<a> 
+  <img src="./assets/AnnoFrog-mainUI.png" alt="Main UI" width="800"/> 
+  
+</a>
 ## Features
 
 *   **Video Loading & Frame Navigation:** Load common video formats (MP4, AVI, MOV, MKV) and easily navigate frames using a visual timeline or keyboard shortcuts.
