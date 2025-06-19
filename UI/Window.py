@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 
 from Annotations.AnnotationHandler import AnnotationHandler
 from AI.RTMOManager import RTMOManager
+from AI.vitpose_manager import ViTPoseManager
 from Annotations.AnnotationMode import AnnotationMode
 from Annotations.PersonAnnotation import PersonAnnotation
 from UI.InterpolationControlPanel import InterpolationControlPanel
@@ -33,6 +34,7 @@ from UI.AIPosePanelWidget import AIPosePanelWidget
 from UI.DeleteAnnotationsPanel import DeleteAnnotationsPanel
 from UI.ClickableLabel import ClickableLabel
 from OGL.OpenGLCanvas import OpenGLCanvas
+
 
 # Device for AI model inference ('cuda' or 'cpu')
 DEVICE = 'cuda'
@@ -58,7 +60,12 @@ VISIBILITY_VISIBLE = 2        # Keypoint annotated as visible
 VISIBILITY_SUGGESTED = 3      # Keypoint is an interpolated suggestion
 VISIBILITY_AI_SUGGESTED = 4   # Keypoint is an AI-generated suggestion
 
-
+VITPOSE_12_OUTPUT_TO_ANNOFROG_14_MAP = {
+    0: 0,  1: 1,  2: 2,  3: 3,  4: 4,  5: 5,
+    6: 6,  7: 7,  8: 8,  9: 9, 10: 10, 11: 11,
+}
+NUM_KEYPOINTS = 14
+VITPOSE_CONF = 0.3 
 
 class Window(QMainWindow):
     """Main application window for the video annotation tool."""
@@ -72,6 +79,7 @@ class Window(QMainWindow):
         self.annotation_handler = AnnotationHandler()
         # self.gl_canvas is initialized in _setup_ui_layout
         self.rtmo_manager = RTMOManager(RTMO_CROWDPOSE_MODEL_PATH, RTMO_MODEL_INPUT_SIZE, device=DEVICE)
+        self.vitpose_manager = ViTPoseManager(device=DEVICE)
 
         # --- Video Data ---
         self.video_frames: list[np.ndarray] = []  # Stores raw BGR frames from the video
@@ -297,15 +305,31 @@ class Window(QMainWindow):
         # 2. Add Suggested Annotations (if not hidden and no real annotation with same ID)
         suggested_persons_on_frame = sorted(self.annotation_handler.get_suggested_annotations_for_frame(frame_idx), key=lambda p: p.id)
         for sugg_person in suggested_persons_on_frame:
-            if sugg_person.id not in listed_person_ids and \
-               sugg_person.id not in self.globally_hidden_person_ids:
-                sugg_type_str = "(AI Sugg)" if sugg_person.has_ai_suggestions() else "(Interp Sugg)"
+            if sugg_person.id not in self.globally_hidden_person_ids: # Basic hidden check
+                sugg_type_str = ""
+                is_ai_sugg = sugg_person.has_ai_suggestions()
+                is_interp_sugg = sugg_person.has_suggestions() and not is_ai_sugg
+
+                if is_ai_sugg:
+                    sugg_type_str = "(AI Sugg. KPs)" # Clarify it's about keypoints
+                elif is_interp_sugg:
+                    sugg_type_str = "(Interp Sugg)"
+                else: # Should not happen if it's in suggested_annotations
+                    continue
+
                 text = f"ID: {sugg_person.id} {sugg_type_str}"
-                # Check if this suggestion (as a shell) is active on the canvas
+
+                # An AI suggestion (even for an existing ID) can be "active" as a shell
                 is_active_suggestion_shell = (self.gl_canvas.active_person is not None and
                                               self.gl_canvas.active_person.id == sugg_person.id and
                                               self.gl_canvas.active_person.is_suggestion_any_type())
-                items_to_add.append((text, sugg_person.id, True, is_active_suggestion_shell))
+
+                # Add if it's a new ID OR if it's an AI suggestion (we want to see "AI Sugg. KPs" entry)
+                # If a real one with same ID is already listed, this adds a second entry for the AI KPs.
+                # This might be desired to explicitly show AI is providing keypoints.
+                # If you only want one entry per ID, the logic needs to merge display info.
+                # For now, let's allow separate listing to make it clear.
+                items_to_add.append((text, sugg_person.id, True, is_active_suggestion_shell)) # True for is_suggestion
 
         # 3. Populate QListWidget
         selected_list_item = None
@@ -844,50 +868,168 @@ class Window(QMainWindow):
 
     # --- AI Pose Estimation Slots ---
     def handle_run_ai_pose_estimation(self):
-        """Runs AI pose estimation on the current frame and adds results as suggestions."""
         if not self.video_frames or self.gl_canvas.current_frame_display_index < 0:
-            self.statusBar().showMessage("No video or frame loaded to run AI on.", 3000)
-            return
-        if not self.rtmo_manager or not self.rtmo_manager.is_ready():
-            self.statusBar().showMessage("AI Model is not ready or failed to load.", 3000)
+            self.statusBar().showMessage("No video/frame loaded.", 3000)
             return
 
         current_frame_idx = self.gl_canvas.current_frame_display_index
         frame_bgr_data = self.video_frames[current_frame_idx]
+        frame_height, frame_width = frame_bgr_data.shape[:2]
 
-        self.statusBar().showMessage(f"Running AI pose estimation on Frame {current_frame_idx + 1}...", 0)
-        QApplication.processEvents() # Allow UI to update
+        selected_mode_text = self.ai_pose_panel.detection_mode_combobox.currentText() # From your AIPosePanelWidget
+        user_bboxes_for_target_mode = self.annotation_handler.get_annotations_for_frame(current_frame_idx)
+        kp_thresh = self.ai_pose_panel.kp_confidence_spinbox.value()
+        
+        self.statusBar().showMessage(f"Running AI ({selected_mode_text}) on F{current_frame_idx + 1}...", 0)
+        QApplication.processEvents()
 
-        ai_poses_result = self.rtmo_manager.predict_poses(frame_bgr_data)
+        if "ViTPose - BBoxes" == selected_mode_text:
+            # --- ViTPose Specific Logic ---
+            if not self.vitpose_manager or not self.vitpose_manager.is_ready():
+                self.statusBar().showMessage("ViTPose Model not ready.", 3000)
+                return
 
-        if ai_poses_result is None: # Indicates an error during prediction
-            self.statusBar().showMessage("AI Pose Estimation failed.", 3000)
-            return
-        if not ai_poses_result: # Empty list, meaning no poses detected by the model
-            self.statusBar().showMessage("AI: No poses detected on this frame.", 3000)
-            return
+            user_annotations_on_frame = self.annotation_handler.get_annotations_for_frame(current_frame_idx)
+            active_user_annotations = [
+                ann for ann in user_annotations_on_frame if not (ann.id in self.globally_hidden_person_ids) and \
+                                                            not self.annotation_handler.is_person_done(ann.id) and \
+                                                            ann.bbox != [0,0,0,0]
+            ]
+            if not active_user_annotations:
+                self.statusBar().showMessage("ViTPose: No active, non-done user bboxes on this frame.", 3000)
+                return
 
-        # Get parameters from AI Panel
-        kp_confidence_thresh = self.ai_pose_panel.kp_confidence_spinbox.value()
-        target_mode_str = self.ai_pose_panel.target_mode_combobox.currentText()
+            bboxes_for_vitpose_pixel_xywh = []
+            ids_and_src_bbox_info = [] 
 
-        user_bboxes_for_target_mode = None
-        if target_mode_str == "Only for Empty User BBoxes":
-            user_bboxes_for_target_mode = self.annotation_handler.get_annotations_for_frame(current_frame_idx)
+            for user_ann in active_user_annotations:
+                norm_bbox = user_ann.bbox
+                x_min_px = norm_bbox[0] * frame_width
+                y_min_px = norm_bbox[1] * frame_height
+                x_max_px = norm_bbox[2] * frame_width
+                y_max_px = norm_bbox[3] * frame_height
+                w_px = x_max_px - x_min_px
+                h_px = y_max_px - y_min_px
+                if w_px <= 0 or h_px <= 0: continue
+                bboxes_for_vitpose_pixel_xywh.append([x_min_px, y_min_px, w_px, h_px])
+                ids_and_src_bbox_info.append({'id': user_ann.id, 'bbox_norm': list(user_ann.bbox)})
+            
+            if not bboxes_for_vitpose_pixel_xywh:
+                self.statusBar().showMessage("ViTPose: No valid bboxes after conversion.", 3000)
+                return
+            
+            vitpose_raw_results = self.vitpose_manager.predict_poses_from_bboxes(frame_bgr_data, bboxes_for_vitpose_pixel_xywh)
 
-        num_suggestions_added = self.annotation_handler.add_ai_pose_suggestions_to_frame(
-            current_frame_idx, ai_poses_result, kp_confidence_thresh, target_mode_str,
-            user_bboxes_for_target_mode,
-            frame_width=self.gl_canvas.current_frame_width,
-            frame_height=self.gl_canvas.current_frame_height
-        )
+            if vitpose_raw_results is None: self.statusBar().showMessage("ViTPose prediction failed.", 3000); return
+            if not vitpose_raw_results: self.statusBar().showMessage("ViTPose: No poses detected.", 3000); return
+            if len(vitpose_raw_results) != len(ids_and_src_bbox_info):
+                 self.statusBar().showMessage("ViTPose: Mismatch input bboxes and results count.", 3000); return
 
-        if num_suggestions_added > 0:
-            self.statusBar().showMessage(f"AI: Added {num_suggestions_added} new pose suggestions to Frame {current_frame_idx + 1}.", 4000)
-            self.gl_canvas.update()
-            self.refresh_persons_list_display(current_frame_idx)
+            # Prepare data for AnnotationHandler
+            ai_poses_for_handler_vitpose = []
+            for i, vit_res_dict in enumerate(vitpose_raw_results):
+                person_id = ids_and_src_bbox_info[i]['id']
+                original_user_bbox_norm = ids_and_src_bbox_info[i]['bbox_norm']
+                
+                keypoints_12_pixel = vit_res_dict['keypoints'] 
+                scores_12 = vit_res_dict['scores']
+
+                # Transform ViTPose 12-keypoint output to AnnoFrog 14-keypoint structure
+                annofrog_kps_pixel = np.zeros((NUM_KEYPOINTS, 2), dtype=np.float32)
+                annofrog_scores = np.zeros(NUM_KEYPOINTS, dtype=np.float32)
+
+                for vit_idx_12, af_idx_14 in VITPOSE_12_OUTPUT_TO_ANNOFROG_14_MAP.items():
+                    if vit_idx_12 < keypoints_12_pixel.shape[0]:
+                        annofrog_kps_pixel[af_idx_14] = keypoints_12_pixel[vit_idx_12]
+                        annofrog_scores[af_idx_14] = scores_12[vit_idx_12]
+                
+                # Head and Neck will have 0 scores and (0,0) pixels unless estimated above
+                # (You mentioned not to estimate them, so they'll be VISIBILITY_NOT_SET by handler)
+
+                ai_poses_for_handler_vitpose.append({
+                    'keypoints': annofrog_kps_pixel,
+                    'scores': annofrog_scores,
+                    'person_id': person_id,          # Crucial: provide the target person ID
+                    'bbox_norm': original_user_bbox_norm, # And the original bbox
+                    'source_model_hint': 'vitpose' # For followup logic
+                })
+            
+            if ai_poses_for_handler_vitpose:
+                # Call your existing AnnotationHandler method.
+                # It needs to be able to use 'person_id' and 'bbox_norm' if present in the dict.
+                num_suggestions_added = self.annotation_handler.add_ai_pose_suggestions_to_frame(
+                    current_frame_idx,
+                    ai_poses_for_handler_vitpose, # List of dicts, each for one person
+                    kp_thresh,
+                    selected_mode_text, # This is now implicitly handled by providing person_id/bbox_norm
+                    user_bboxes_for_target_mode, # Not needed if we pass person_id/bbox_norm directly
+                    frame_width=frame_width,
+                    frame_height=frame_height
+                )
+                if num_suggestions_added > 0:
+                    self.statusBar().showMessage(f"ViTPose: Added/Updated {num_suggestions_added} suggestions.", 3000)
+                    self.gl_canvas.update()
+                    self.refresh_persons_list_display(current_frame_idx)
+                else:
+                    self.statusBar().showMessage("ViTPose: No new suggestions met criteria.", 3000)
+            else:
+                self.statusBar().showMessage("ViTPose: No poses processed.", 3000)
+
+        elif "RTMO - BBoxes" == selected_mode_text or \
+             "RTMO - frame" == selected_mode_text:
+            
+            if not self.rtmo_manager or not self.rtmo_manager.is_ready():
+                self.statusBar().showMessage("RTMO Model is not ready or failed to load.", 3000) 
+                return
+
+            ai_poses_result_rtmo = self.rtmo_manager.predict_poses(frame_bgr_data)
+
+            if ai_poses_result_rtmo is None:
+                self.statusBar().showMessage("RTMO Pose Estimation failed.", 3000)
+                return
+            if not ai_poses_result_rtmo:
+                self.statusBar().showMessage("RTMO: No poses detected on this frame.", 3000)
+                return
+
+            # Add source hint to RTMO results
+            for res in ai_poses_result_rtmo:
+                res['source_model_hint'] = 'rtmo'
+                if "RTMO - Only for Empty User BBoxes" == selected_mode_text:
+                    res['source_model_hint'] = 'rtmo_empty_attempt'
+
+
+            user_bboxes_for_rtmo_empty_mode = None
+            if "RTMO - BBoxes" == selected_mode_text:
+                #user_bboxes_for_rtmo_empty_mode = self.annotation_handler.get_annotations_for_frame(current_frame_idx)
+                
+                num_suggestions_added = self.annotation_handler.add_ai_pose_suggestions_to_frame(
+                    current_frame_idx, ai_poses_result_rtmo, kp_thresh,
+                    selected_mode_text, # Pass the mode string
+                    user_bboxes_for_target_mode, # Pass the user bboxes
+                    frame_width=frame_width,
+                    frame_height=frame_height
+                )
+
+            else: # "RTMO - All Detected People"
+                 num_suggestions_added = self.annotation_handler.add_ai_pose_suggestions_to_frame(
+                    current_frame_idx, ai_poses_result_rtmo, kp_thresh,
+                    selected_mode_text, # "RTMO - All Detected People"
+                    None, # No specific user_bboxes for this mode
+                    frame_width=frame_width,
+                    frame_height=frame_height
+                )
+
+
+            if num_suggestions_added > 0:
+                self.statusBar().showMessage(f"RTMO: Added {num_suggestions_added} new pose suggestions.", 4000) # Corrected duration
+                self.gl_canvas.update()
+                self.refresh_persons_list_display(current_frame_idx)
+            else:
+                self.statusBar().showMessage("RTMO: No new suggestions met criteria.", 3000)
         else:
-            self.statusBar().showMessage("AI: No new suggestions met the criteria to be added.", 3000)
+            self.statusBar().showMessage(f"Unknown AI detection mode: {selected_mode_text}", 3000)
+            return
+
         self.gl_canvas.setFocus()
 
     # --- Video Loading and Timeline Management ---
@@ -1259,3 +1401,7 @@ class Window(QMainWindow):
         else:
             # Important: Pass unhandled events to superclass (allows GLCanvas to get key events too)
             super().keyPressEvent(event)
+
+    def _is_person_globally_hidden(self, person_id: int) -> bool:
+        """Checks if a person ID is in the window's globally_hidden_person_ids set."""
+        return person_id in self.globally_hidden_person_ids

@@ -435,8 +435,17 @@ class OpenGLCanvas(QOpenGLWidget):
             text_to_render = ""
             if self.dragged_keypoint_info and self.dragged_keypoint_info[0] is self.active_person:
                 text_to_render = f"Dragging: {KEYPOINT_NAMES[self.dragged_keypoint_info[1]]}"
+            elif self.active_person.all_keypoints_set(): #
+                text_to_render = ""
             else:
-                text_to_render = f"Place: {KEYPOINT_NAMES[self.current_keypoint_idx_to_place]}"
+                if 0 <= self.current_keypoint_idx_to_place < NUM_KEYPOINTS:
+                    text_to_render = f"Place: {KEYPOINT_NAMES[self.current_keypoint_idx_to_place]}"
+                else:
+                    next_unset_for_tooltip = self.active_person.get_next_unset_keypoint_idx(0)
+                    if next_unset_for_tooltip is not None:
+                        text_to_render = f"Place: {KEYPOINT_NAMES[next_unset_for_tooltip]}"
+                    else:
+                        text_to_render = "" # Generic
 
             # Calculate text position near cursor (screen coordinates)
             font = QFont(self.text_font_name, self.text_font_size_pt)
@@ -478,11 +487,6 @@ class OpenGLCanvas(QOpenGLWidget):
         self.text_shader_program.setUniformValue("font_texture_sampler", 0) # Texture unit 0
         self.text_shader_program.setUniformValue("text_render_color", color)
 
-        # Orthographic projection matrix: maps screen pixel coords to NDC (-1 to 1)
-        # QMatrix4x4 constructor is row-major. OpenGL expects column-major.
-        # Transpose happens automatically when passing to setUniformValue if matrix is QMatrix4x4.
-        # X: (pixel / width) * 2 - 1
-        # Y: 1 - (pixel / height) * 2 (flipped Y)
         proj_matrix = QMatrix4x4(
             2.0 / self.width(), 0.0,                  0.0, -1.0,  # col 1
             0.0,                -2.0 / self.height(), 0.0,  1.0,  # col 2 (Y is inverted)
@@ -540,240 +544,253 @@ class OpenGLCanvas(QOpenGLWidget):
         glBindVertexArray(0)
         self.text_shader_program.release()
 
+
+
     def _prepare_annotation_vbo_data(self) -> tuple[np.ndarray | None, list[dict]]:
         """
         Prepares vertex data and draw commands for all annotations on the current frame.
-        Data is transformed to Normalized Device Coordinates (NDC) for rendering.
-        Handles visibility (real, suggested, AI), active state, "done" state, and global hide.
-        Returns:
-            - np.ndarray: Float32 vertex data (x,y pairs in NDC), or None if no data.
-            - list[dict]: List of draw commands, each specifying color, primitive type, etc.
+        This version explicitly handles rendering AI keypoints within existing user bounding boxes.
         """
-        vertex_data_accumulator = []  # List to accumulate (x, y) NDC coordinates
-        draw_commands = []         # List of dictionaries for draw calls
-        current_vbo_offset = 0     # Tracks current position in the VBO
+        vertex_data_accumulator = []
+        draw_commands = []
+        current_vbo_offset = 0
 
+        # --- add_render_command helper function (no changes needed here) ---
         def add_render_command(points_ndc: list[QPointF], color_vec3: QVector3D,
                                primitive_type, point_size_px: float = KEYPOINT_SCREEN_SIZE_PX,
-                               is_suggestion_render: bool = False):
-            """Helper to add vertices and a corresponding draw command."""
+                               is_suggestion_render_style: bool = False): # Renamed for clarity
             nonlocal current_vbo_offset
             if not points_ndc: return
-
             final_color = color_vec3
             final_point_size = point_size_px
-
-            # Modify appearance for suggestions
-            if is_suggestion_render:
+            if is_suggestion_render_style: # Use this flag for styling
                 if primitive_type == GL_POINTS:
-                    final_color = QVector3D(color_vec3.x() * 0.6, color_vec3.y() * 0.6, color_vec3.z() * 0.6) # Dimmer
-                    final_point_size = point_size_px * 0.8 # Smaller
+                    final_color = QVector3D(color_vec3.x() * 0.6, color_vec3.y() * 0.6, color_vec3.z() * 0.6)
+                    final_point_size = point_size_px * 0.8
                 elif primitive_type == GL_LINES:
-                    final_color = QVector3D(color_vec3.x() * 0.5, color_vec3.y() * 0.5, color_vec3.z() * 0.5) # Dimmer
-
+                    final_color = QVector3D(color_vec3.x() * 0.5, color_vec3.y() * 0.5, color_vec3.z() * 0.5)
             if not isinstance(final_point_size, float): final_point_size = float(final_point_size)
-
             num_vertices_added = 0
             for p_ndc in points_ndc:
                 vertex_data_accumulator.extend([p_ndc.x(), p_ndc.y()])
             num_vertices_added = len(points_ndc)
-
             if num_vertices_added > 0:
                 draw_commands.append({
-                    'color': final_color,
-                    'first': current_vbo_offset,
-                    'count': num_vertices_added,
-                    'primitive': primitive_type,
-                    'point_size': final_point_size
+                    'color': final_color, 'first': current_vbo_offset, 'count': num_vertices_added,
+                    'primitive': primitive_type, 'point_size': final_point_size
                 })
                 current_vbo_offset += num_vertices_added
+        # --- End of add_render_command helper ---
 
-        # --- Collect all person information for the current frame ---
-        all_persons_to_render_info = [] # Stores dicts: {"person_obj": PersonAnnotation, "is_suggested": bool, "suggestion_type": str|None}
+        # List of dictionaries, each representing a "render task"
+        # Keys: 'person_obj', 'draw_bbox', 'draw_keypoints', 'draw_skeleton', 'is_suggestion_style'
+        render_tasks = []
 
-        # 1. Add real annotations, respecting global hide state
-        for person_real in self.annotation_handler.get_annotations_for_frame(self.current_frame_display_index):
-            # Check if this person is globally hidden (Window class manages this set)
-            parent_window = self.window() # Expected to be the main Window instance
-            if isinstance(parent_window, Window.Window) and person_real.id in parent_window.globally_hidden_person_ids:
-                print("skipping hidden person")
-                continue # Skip hidden person
-            all_persons_to_render_info.append({"person_obj": person_real, "is_suggested": False, "suggestion_type": None})
+        current_real_annotations = self.annotation_handler.get_annotations_for_frame(self.current_frame_display_index)
+        current_suggested_annotations = self.annotation_handler.get_suggested_annotations_for_frame(self.current_frame_display_index)
 
-        real_person_ids_on_frame = {p_info["person_obj"].id for p_info in all_persons_to_render_info if not p_info["is_suggested"]}
+        
+        processed_real_ids = set()
+        for person_real in current_real_annotations:
+            if self._is_person_globally_hidden(person_real.id):
+                continue
+            render_tasks.append({
+                "person_obj": person_real,
+                "draw_bbox": True,
+                "draw_keypoints": True, # Will only draw non-suggested KPs from this object
+                "draw_skeleton": True,  # Will only draw skeleton from non-suggested KPs
+                "is_suggestion_style": False # Rendered as a "real" entity
+            })
+            processed_real_ids.add(person_real.id)
 
-        current_suggestions = self.annotation_handler.get_suggested_annotations_for_frame(self.current_frame_display_index)
-        frame_has_any_ai_suggestions_rendered = False # To prioritize AI suggestions over interpolated if both exist
+        # Step 2: Process SUGGESTED annotations.
+        # These can either be "pure" suggestions (new ID) or AI keypoint overlays for existing real IDs.
+        for person_sugg in current_suggested_annotations:
+            if self._is_person_globally_hidden(person_sugg.id):
+                continue
 
-        # 2. Add AI suggestions if not hidden and no real annotation for that ID exists
-        for person_suggested_ai in current_suggestions:
-            if person_suggested_ai.id not in real_person_ids_on_frame and person_suggested_ai.has_ai_suggestions():
-                parent_window = self.window()
-                if isinstance(parent_window, Window.Window) and person_suggested_ai.id in parent_window.globally_hidden_person_ids:
-                    continue
-                all_persons_to_render_info.append({"person_obj": person_suggested_ai, "is_suggested": True, "suggestion_type": "AI"})
-                frame_has_any_ai_suggestions_rendered = True
+            is_ai_suggestion = person_sugg.has_ai_suggestions()
+            is_interp_suggestion = person_sugg.has_suggestions() and not is_ai_suggestion
 
-        # 3. Add Interpolated suggestions IF no AI suggestions are rendered for the frame,
-        #    not hidden, and no real annotation for that ID exists.
-        if not frame_has_any_ai_suggestions_rendered: # Prioritize showing AI suggestions
-            for person_suggested_interp in current_suggestions:
-                if person_suggested_interp.id not in real_person_ids_on_frame:
-                    parent_window = self.window()
-                    if isinstance(parent_window, Window.Window) and person_suggested_interp.id in parent_window.globally_hidden_person_ids:
-                        continue
-                    # Ensure it's purely interpolated (not also AI, though covered by above flag)
-                    if person_suggested_interp.has_suggestions() and not person_suggested_interp.has_ai_suggestions():
-                        all_persons_to_render_info.append({"person_obj": person_suggested_interp, "is_suggested": True, "suggestion_type": "Interpolated"})
+            # Check if a real annotation with the same ID was already added to render_tasks
+            # This means there's a user-defined bounding box for this ID.
+            real_task_exists_for_id = person_sugg.id in processed_real_ids
 
-        # --- Process each person for rendering ---
-        for person_info_item in all_persons_to_render_info:
-            person = person_info_item["person_obj"]
-            is_suggestion = person_info_item["is_suggested"]
+            if real_task_exists_for_id:
+                if is_ai_suggestion:
+                    # This AI suggestion is for an existing real person.
+                    # We want to draw its keypoints and skeleton if the real person's annotation is "empty".
+                    real_obj_for_id = next((p for p in current_real_annotations if p.id == person_sugg.id), None)
+                    if real_obj_for_id: # Should always be found if real_task_exists_for_id
+                        num_real_kps_user = sum(1 for kp_u in real_obj_for_id.keypoints if kp_u[2] in [VISIBILITY_VISIBLE, VISIBILITY_OCCLUDED])
+                        if num_real_kps_user <= 1: # If the real annotation is "empty" of keypoints
+                            render_tasks.append({
+                                "person_obj": person_sugg,      # Use the suggestion object for its AI keypoints
+                                "draw_bbox": False,             # Bbox already drawn by the real task
+                                "draw_keypoints": True,
+                                "draw_skeleton": True,
+                                "is_suggestion_style": True     # Keypoints/skeleton styled as suggestion
+                            })
+
+            else:
+                # No real annotation for this ID. This is a "pure" new suggestion.
+                # Draw its bbox (if any), keypoints, and skeleton.
+                render_tasks.append({
+                    "person_obj": person_sugg,
+                    "draw_bbox": True, # Draw the suggestion's own bbox
+                    "draw_keypoints": True,
+                    "draw_skeleton": True,
+                    "is_suggestion_style": True # All parts styled as suggestion
+                })
+
+        # --- Drawing Loop: Iterate through the prepared render_tasks ---
+        for task in render_tasks:
+            person = task["person_obj"]
+            is_styled_as_suggestion = task["is_suggestion_style"] # For dimming/sizing in add_render_command
+
             is_person_globally_done = self.annotation_handler.is_person_done(person.id)
+            is_active_on_canvas = (self.active_person is not None and
+                                   self.active_person.id == person.id)
+            
+            # Refine active_on_canvas based on whether the canvas's active_person matches the style of this task
+            if self.active_person:
+                if is_styled_as_suggestion: # This task is for rendering something in suggestion style
+                    is_active_on_canvas = (self.active_person.id == person.id and
+                                           self.active_person.is_suggestion_any_type())
+                else: # This task is for rendering something in real style
+                    is_active_on_canvas = (self.active_person.id == person.id and
+                                           not self.active_person.is_suggestion_any_type())
 
-            # Bounding Box (only for real, non-suggested annotations)
-            # Normalized image coords for bbox: [x_min_norm, y_min_norm, x_max_norm, y_max_norm]
-            p1_norm_bbox = QPointF(person.bbox[0], person.bbox[1])
-            p2_norm_bbox = QPointF(person.bbox[2], person.bbox[3])
-            # Ensure tl (top-left) and br (bottom-right) are correctly ordered
-            tl_img_norm_bbox = QPointF(min(p1_norm_bbox.x(), p2_norm_bbox.x()), min(p1_norm_bbox.y(), p2_norm_bbox.y()))
-            br_img_norm_bbox = QPointF(max(p1_norm_bbox.x(), p2_norm_bbox.x()), max(p1_norm_bbox.y(), p2_norm_bbox.y()))
-            # Convert to render NDC (Normalized Device Coordinates)
-            tl_ndc_bbox = self._normalized_image_to_render_ndc(tl_img_norm_bbox)
-            br_ndc_bbox = self._normalized_image_to_render_ndc(br_img_norm_bbox)
+            # --- Bounding Box ---
+            if task["draw_bbox"] and person.bbox != [0.0, 0.0, 0.0, 0.0]:
+                tl_img_norm_bbox = QPointF(min(person.bbox[0], person.bbox[2]), min(person.bbox[1], person.bbox[3]))
+                br_img_norm_bbox = QPointF(max(person.bbox[0], person.bbox[2]), max(person.bbox[1], person.bbox[3]))
+                tl_ndc_bbox = self._normalized_image_to_render_ndc(tl_img_norm_bbox)
+                br_ndc_bbox = self._normalized_image_to_render_ndc(br_img_norm_bbox)
+                tr_ndc_bbox = QPointF(br_ndc_bbox.x(), tl_ndc_bbox.y())
+                bl_ndc_bbox = QPointF(tl_ndc_bbox.x(), br_ndc_bbox.y())
 
-            if not is_suggestion and person.bbox != [0.0, 0.0, 0.0, 0.0]: # Only draw valid bboxes for real annotations
-                tr_ndc_bbox = QPointF(br_ndc_bbox.x(), tl_ndc_bbox.y()) # Top-right
-                bl_ndc_bbox = QPointF(tl_ndc_bbox.x(), br_ndc_bbox.y()) # Bottom-left
+                bbox_color = QVector3D(0.0, 1.0, 0.0) # Default green for real, or base for suggestion
+                if is_active_on_canvas and not is_styled_as_suggestion:
+                    bbox_color = QVector3D(1.0, 1.0, 0.0) # Yellow for active real
 
-                bbox_color = QVector3D(1.0, 1.0, 0.0) if self.active_person is person else QVector3D(0.0, 1.0, 0.0) # Yellow if active, Green otherwise
-                if is_person_globally_done: # Dim color if person is marked "done"
-                    bbox_color = QVector3D(bbox_color.x() * 0.3, bbox_color.y() * 0.3, bbox_color.z() * 0.3)
+                if is_person_globally_done and not is_styled_as_suggestion:
+                    bbox_color.setX(bbox_color.x() * 0.3); bbox_color.setY(bbox_color.y() * 0.3); bbox_color.setZ(bbox_color.z() * 0.3)
+
                 add_render_command([tl_ndc_bbox, tr_ndc_bbox, tr_ndc_bbox, br_ndc_bbox,
                                     br_ndc_bbox, bl_ndc_bbox, bl_ndc_bbox, tl_ndc_bbox],
-                                   bbox_color, GL_LINES, is_suggestion_render=False)
+                                   bbox_color, GL_LINES,
+                                   is_suggestion_render_style=is_styled_as_suggestion)
 
-                # Draw BBox resize handles if this person is active, real, not done, and in IDLE/PLACING_KEYPOINTS mode
-                if self.active_person is person and not is_suggestion and not is_person_globally_done and \
+                # BBox resize handles (only for active, REAL, non-done, non-hidden)
+                if is_active_on_canvas and not is_styled_as_suggestion and not is_person_globally_done and \
+                   not self._is_person_globally_hidden(person.id) and \
                    (self.current_mode == AnnotationMode.IDLE or self.current_mode == AnnotationMode.PLACING_KEYPOINTS):
-                    corner_color = QVector3D(1.0, 0.5, 0.0) # Orange
+                    corner_color = QVector3D(1.0, 0.5, 0.0)
                     handle_size_ndc_half = self.bbox_corner_draw_size_ndc / 2.0
-                    # Top-left handle
+                    # TL handle
                     tl_h_tl = QPointF(tl_ndc_bbox.x() - handle_size_ndc_half, tl_ndc_bbox.y() + handle_size_ndc_half)
                     tl_h_br = QPointF(tl_ndc_bbox.x() + handle_size_ndc_half, tl_ndc_bbox.y() - handle_size_ndc_half)
-                    add_render_command([QPointF(tl_h_tl.x(), tl_h_tl.y()), QPointF(tl_h_br.x(), tl_h_tl.y()), # Top
-                                        QPointF(tl_h_br.x(), tl_h_tl.y()), QPointF(tl_h_br.x(), tl_h_br.y()), # Right
-                                        QPointF(tl_h_br.x(), tl_h_br.y()), QPointF(tl_h_tl.x(), tl_h_br.y()), # Bottom
-                                        QPointF(tl_h_tl.x(), tl_h_br.y()), QPointF(tl_h_tl.x(), tl_h_tl.y())],# Left
-                                       corner_color, GL_LINES)
-                    # Bottom-right handle
+                    add_render_command([QPointF(tl_h_tl.x(), tl_h_tl.y()), QPointF(tl_h_br.x(), tl_h_tl.y()), QPointF(tl_h_br.x(), tl_h_tl.y()), QPointF(tl_h_br.x(), tl_h_br.y()), QPointF(tl_h_br.x(), tl_h_br.y()), QPointF(tl_h_tl.x(), tl_h_br.y()), QPointF(tl_h_tl.x(), tl_h_br.y()), QPointF(tl_h_tl.x(), tl_h_tl.y())], corner_color, GL_LINES, is_suggestion_render_style=False)
+                    # BR handle
                     br_h_tl = QPointF(br_ndc_bbox.x() - handle_size_ndc_half, br_ndc_bbox.y() + handle_size_ndc_half)
                     br_h_br = QPointF(br_ndc_bbox.x() + handle_size_ndc_half, br_ndc_bbox.y() - handle_size_ndc_half)
-                    add_render_command([QPointF(br_h_tl.x(), br_h_tl.y()), QPointF(br_h_br.x(), br_h_tl.y()),
-                                        QPointF(br_h_br.x(), br_h_tl.y()), QPointF(br_h_br.x(), br_h_br.y()),
-                                        QPointF(br_h_br.x(), br_h_br.y()), QPointF(br_h_tl.x(), br_h_br.y()),
-                                        QPointF(br_h_tl.x(), br_h_br.y()), QPointF(br_h_tl.x(), br_h_tl.y())],
-                                       corner_color, GL_LINES)
+                    add_render_command([QPointF(br_h_tl.x(), br_h_tl.y()), QPointF(br_h_br.x(), br_h_tl.y()), QPointF(br_h_br.x(), br_h_tl.y()), QPointF(br_h_br.x(), br_h_br.y()), QPointF(br_h_br.x(), br_h_br.y()), QPointF(br_h_tl.x(), br_h_br.y()), QPointF(br_h_tl.x(), br_h_br.y()), QPointF(br_h_tl.x(), br_h_tl.y())], corner_color, GL_LINES, is_suggestion_render_style=False)
 
-            # Keypoints
-            keypoints_ndc_cache = [None] * NUM_KEYPOINTS # Cache NDC coords of keypoints
-            keypoint_render_params = [] # List of (ndc_pos, color, size, is_kp_suggestion)
+            # --- Keypoints and Skeleton ---
+            keypoints_ndc_cache = [None] * NUM_KEYPOINTS # Must be populated for skeleton even if KPs aren't drawn by this task
+            temp_keypoint_params_for_skeleton = [] # To get NDC coords for skeleton
 
+            # First pass: get all KP NDC coords for this person object for skeleton drawing
             for i, (x_norm, y_norm, visibility) in enumerate(person.keypoints):
-                if visibility == VISIBILITY_NOT_SET: continue
+                if visibility != VISIBILITY_NOT_SET:
+                    keypoints_ndc_cache[i] = self._normalized_image_to_render_ndc(QPointF(x_norm, y_norm))
 
-                kp_ndc = self._normalized_image_to_render_ndc(QPointF(x_norm, y_norm))
-                keypoints_ndc_cache[i] = kp_ndc
+            if task["draw_keypoints"]:
+                keypoint_render_params = []
+                for i, (x_norm, y_norm, visibility) in enumerate(person.keypoints):
+                    if visibility == VISIBILITY_NOT_SET: continue
+                    # kp_ndc already in keypoints_ndc_cache[i] if set
+                    kp_ndc = keypoints_ndc_cache[i]
+                    if kp_ndc is None: continue # Should not happen if visibility != NOT_SET
 
-                is_current_kp_being_placed_or_dragged = (
-                    self.active_person is person and not is_suggestion and
-                    ((self.current_mode == AnnotationMode.PLACING_KEYPOINTS and
-                      i == self.current_keypoint_idx_to_place and not self.dragged_keypoint_info) or
-                     (self.dragged_keypoint_info and self.dragged_keypoint_info[0] is person and
-                      self.dragged_keypoint_info[1] == i))
-                )
+                    is_current_kp_being_placed_or_dragged = (
+                        is_active_on_canvas and not is_styled_as_suggestion and
+                        not is_person_globally_done and not self._is_person_globally_hidden(person.id) and
+                        ((self.current_mode == AnnotationMode.PLACING_KEYPOINTS and
+                          i == self.current_keypoint_idx_to_place and not self.dragged_keypoint_info) or
+                         (self.dragged_keypoint_info and
+                          self.dragged_keypoint_info[0].id == person.id and
+                          self.dragged_keypoint_info[1] == i))
+                    )
 
-                # Determine color based on visibility and state
-                kp_color_tuple = (0.5, 0.5, 0.5) # Default (should not happen if visibility is set)
-                if visibility == VISIBILITY_SUGGESTED: kp_color_tuple = (0.6, 0.6, 0.6) # Light gray for interpolated
-                elif visibility == VISIBILITY_AI_SUGGESTED: kp_color_tuple = (0.3, 0.7, 0.7) # Teal for AI
-                elif is_current_kp_being_placed_or_dragged: kp_color_tuple = (1.0, 0.5, 0.0) # Orange for active editing
-                elif visibility == VISIBILITY_VISIBLE: kp_color_tuple = (1.0, 0.0, 0.0) # Red for visible
-                elif visibility == VISIBILITY_OCCLUDED: kp_color_tuple = (0.0, 0.0, 1.0) # Blue for occluded
+                    kp_color_tuple = (0.5, 0.5, 0.5)
+                    if visibility == VISIBILITY_SUGGESTED: kp_color_tuple = (0.6, 0.6, 0.6)
+                    elif visibility == VISIBILITY_AI_SUGGESTED: kp_color_tuple = (0.3, 0.7, 0.7)
+                    elif is_current_kp_being_placed_or_dragged: kp_color_tuple = (1.0, 0.5, 0.0)
+                    elif visibility == VISIBILITY_VISIBLE: kp_color_tuple = (1.0, 0.0, 0.0)
+                    elif visibility == VISIBILITY_OCCLUDED: kp_color_tuple = (0.0, 0.0, 1.0)
 
-                final_kp_color = QVector3D(*kp_color_tuple)
-                if is_person_globally_done and not is_suggestion: # Dim if person is "done"
-                    final_kp_color = QVector3D(final_kp_color.x() * 0.3, final_kp_color.y() * 0.3, final_kp_color.z() * 0.3)
+                    final_kp_color = QVector3D(*kp_color_tuple)
+                    if is_person_globally_done and not is_styled_as_suggestion: # Dim done real KPs
+                        final_kp_color.setX(final_kp_color.x() * 0.3); final_kp_color.setY(final_kp_color.y() * 0.3); final_kp_color.setZ(final_kp_color.z() * 0.3)
 
-                point_draw_size = KEYPOINT_SCREEN_SIZE_PX
-                if not is_suggestion: # Real keypoints can be larger
-                    if is_current_kp_being_placed_or_dragged: point_draw_size *= 1.5
-                    elif self.active_person is person and not is_person_globally_done: point_draw_size *= 1.2
+                    point_draw_size = KEYPOINT_SCREEN_SIZE_PX
+                    if not is_styled_as_suggestion: # Real KPs styling
+                        if is_current_kp_being_placed_or_dragged: point_draw_size *= 1.5
+                        elif is_active_on_canvas and not is_person_globally_done: point_draw_size *= 1.2
+                    
+                    # This flag determines if the individual KP point uses suggestion styling
+                    is_this_kp_point_styled_as_suggestion = visibility in [VISIBILITY_SUGGESTED, VISIBILITY_AI_SUGGESTED]
+                    keypoint_render_params.append((kp_ndc, final_kp_color, point_draw_size, is_this_kp_point_styled_as_suggestion))
 
-                is_this_kp_a_suggestion = visibility in [VISIBILITY_SUGGESTED, VISIBILITY_AI_SUGGESTED]
-                keypoint_render_params.append((kp_ndc, final_kp_color, point_draw_size, is_this_kp_a_suggestion))
+                keypoint_render_params.sort(key=lambda x: (x[3], id(x[1]), x[2])) # Sort to draw suggestions smaller/behind
+                for kp_ndc_pos, kp_col, kp_sz, is_kp_sugg_style_flag in keypoint_render_params:
+                    add_render_command([kp_ndc_pos], kp_col, GL_POINTS, point_size_px=kp_sz, is_suggestion_render_style=is_kp_sugg_style_flag)
 
-            # Sort keypoints to draw suggestions (smaller, dimmer) potentially behind real ones if overlapping.
-            # This is mostly for visual effect; actual hit testing uses original data.
-            keypoint_render_params.sort(key=lambda x: (x[3], id(x[1]), x[2])) # Sort by: is_suggestion, color (stable), size
-            for kp_ndc_pos, kp_col, kp_sz, is_kp_sugg_render in keypoint_render_params:
-                add_render_command([kp_ndc_pos], kp_col, GL_POINTS, point_size_px=kp_sz, is_suggestion_render=is_kp_sugg_render)
+            if task["draw_skeleton"]:
+                skeleton_color = QVector3D(0.7, 0.7, 0.7) # Default gray
+                if is_styled_as_suggestion: # Skeleton from a suggestion object
+                    if any(kp[2] == VISIBILITY_AI_SUGGESTED for kp in person.keypoints): skeleton_color = QVector3D(0.4, 0.6, 0.6)
+                elif is_active_on_canvas: # Active real person's skeleton
+                    skeleton_color = QVector3D(1.0, 1.0, 0.5)
+                else: # Inactive real person's skeleton
+                    skeleton_color = QVector3D(1.0, 1.0, 1.0)
 
-            # Skeleton
-            skeleton_color = QVector3D(0.7, 0.7, 0.7) # Default light gray
-            if is_suggestion:
-                if any(kp[2] == VISIBILITY_AI_SUGGESTED for kp in person.keypoints): # If any part is AI
-                    skeleton_color = QVector3D(0.4, 0.6, 0.6) # Dim teal for AI suggestion skeleton
-                # else: default gray for interpolated suggestion skeleton
-            elif self.active_person is person:
-                skeleton_color = QVector3D(1.0, 1.0, 0.5) # Bright yellow for active person's skeleton
-            else: # Inactive real person
-                skeleton_color = QVector3D(1.0, 1.0, 1.0) # White for other real skeletons
+                if is_person_globally_done and not is_styled_as_suggestion: # Dim done real skeleton
+                    skeleton_color.setX(skeleton_color.x() * 0.3); skeleton_color.setY(skeleton_color.y() * 0.3); skeleton_color.setZ(skeleton_color.z() * 0.3)
 
-            final_skeleton_color = skeleton_color
-            if is_person_globally_done and not is_suggestion: # Dim if person is "done"
-                final_skeleton_color = QVector3D(skeleton_color.x() * 0.3, skeleton_color.y() * 0.3, skeleton_color.z() * 0.3)
+                skeleton_lines_ndc = []
+                for i1, i2 in SKELETON_EDGES:
+                    v1_vis = person.keypoints[i1][2]
+                    v2_vis = person.keypoints[i2][2]
+                    # Check if both KPs forming the edge are "set" (not VISIBILITY_NOT_SET)
+                    if v1_vis != VISIBILITY_NOT_SET and v2_vis != VISIBILITY_NOT_SET and \
+                       keypoints_ndc_cache[i1] and keypoints_ndc_cache[i2]:
+                        skeleton_lines_ndc.extend([keypoints_ndc_cache[i1], keypoints_ndc_cache[i2]])
+                
+                add_render_command(skeleton_lines_ndc, skeleton_color, GL_LINES, is_suggestion_render_style=is_styled_as_suggestion)
 
-            skeleton_lines_ndc = []
-            for kp_idx1, kp_idx2 in SKELETON_EDGES:
-                visibility1 = person.keypoints[kp_idx1][2]
-                visibility2 = person.keypoints[kp_idx2][2]
 
-                # Edge is suggested if both its keypoints are of the same suggestion type
-                is_suggested_edge = (visibility1 == VISIBILITY_SUGGESTED and visibility2 == VISIBILITY_SUGGESTED) or \
-                                    (visibility1 == VISIBILITY_AI_SUGGESTED and visibility2 == VISIBILITY_AI_SUGGESTED)
-                # Edge is real if both its keypoints are user-set
-                is_real_edge = (visibility1 in [VISIBILITY_VISIBLE, VISIBILITY_OCCLUDED] and \
-                                visibility2 in [VISIBILITY_VISIBLE, VISIBILITY_OCCLUDED])
-
-                if (is_suggested_edge or is_real_edge) and \
-                   keypoints_ndc_cache[kp_idx1] and keypoints_ndc_cache[kp_idx2]:
-                    skeleton_lines_ndc.extend([keypoints_ndc_cache[kp_idx1], keypoints_ndc_cache[kp_idx2]])
-            add_render_command(skeleton_lines_ndc, final_skeleton_color, GL_LINES, is_suggestion_render=is_suggestion)
-
-        # --- Draw temporary elements like BBox creation guides or crosshairs ---
+        # --- Draw temporary elements (crosshairs, temp bbox being created) ---
         if self.current_mode == AnnotationMode.CREATING_BBOX_P2 and self.temp_bbox_start_norm_coords:
-            # Draw the rectangle being created
             p1_norm_img = self.temp_bbox_start_norm_coords
             p2_norm_img = self._widget_to_normalized_image_coords(self.current_mouse_screen_pos)
             p1_ndc = self._normalized_image_to_render_ndc(p1_norm_img)
             p2_ndc = self._normalized_image_to_render_ndc(p2_norm_img)
-
             tl_ndc = QPointF(min(p1_ndc.x(), p2_ndc.x()), min(p1_ndc.y(), p2_ndc.y()))
             br_ndc = QPointF(max(p1_ndc.x(), p2_ndc.x()), max(p1_ndc.y(), p2_ndc.y()))
             tr_ndc = QPointF(br_ndc.x(), tl_ndc.y())
             bl_ndc = QPointF(tl_ndc.x(), br_ndc.y())
             add_render_command([tl_ndc, tr_ndc, tr_ndc, br_ndc, br_ndc, bl_ndc, bl_ndc, tl_ndc],
-                               QVector3D(0.5, 0.5, 1.0), GL_LINES) # Light blue for temp bbox
+                               QVector3D(0.5, 0.5, 1.0), GL_LINES, is_suggestion_render_style=False)
 
-        # Draw crosshairs in BBox creation modes
         if self.current_mode in [AnnotationMode.CREATING_BBOX_P1, AnnotationMode.CREATING_BBOX_P2] and \
            self.width() > 0 and self.height() > 0:
             mouse_ndc_canvas = self._screen_pos_to_canvas_ndc(self.current_mouse_screen_pos)
             crosshair_color = QVector3D(0.7, 0.7, 0.7)
-            add_render_command([QPointF(-1.0, mouse_ndc_canvas.y()), QPointF(1.0, mouse_ndc_canvas.y())], crosshair_color, GL_LINES) # Horizontal
-            add_render_command([QPointF(mouse_ndc_canvas.x(), -1.0), QPointF(mouse_ndc_canvas.x(), 1.0)], crosshair_color, GL_LINES) # Vertical
+            add_render_command([QPointF(-1.0, mouse_ndc_canvas.y()), QPointF(1.0, mouse_ndc_canvas.y())], crosshair_color, GL_LINES, is_suggestion_render_style=False)
+            add_render_command([QPointF(mouse_ndc_canvas.x(), -1.0), QPointF(mouse_ndc_canvas.x(), 1.0)], crosshair_color, GL_LINES, is_suggestion_render_style=False)
 
         return (np.array(vertex_data_accumulator, dtype=np.float32) if vertex_data_accumulator else None, draw_commands)
 

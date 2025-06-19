@@ -19,6 +19,8 @@ VISIBILITY_VISIBLE = 2        # Keypoint annotated as visible
 VISIBILITY_SUGGESTED = 3      # Keypoint is an interpolated suggestion
 VISIBILITY_AI_SUGGESTED = 4   # Keypoint is an AI-generated suggestion
 
+
+
 from Annotations.PersonAnnotation import PersonAnnotation
 
 class AnnotationHandler(QObject):
@@ -214,6 +216,28 @@ class AnnotationHandler(QObject):
 
             suggested_person = PersonAnnotation(person_id=person_id, bbox=list(person_start.bbox)) # Use start bbox for now
             t = (frame_k - start_frame_idx) / (end_frame_idx - start_frame_idx) # Interpolation factor
+            
+            # --- Bounding Box Interpolation ---
+            start_bbox_coords = person_start.bbox
+            end_bbox_coords = person_end.bbox
+
+            # Interpolate bbox if both start and end bboxes are defined (not [0,0,0,0])
+            start_bbox_defined = not (abs(start_bbox_coords[0]) < 1e-6 and abs(start_bbox_coords[1]) < 1e-6 and \
+                                      abs(start_bbox_coords[2]) < 1e-6 and abs(start_bbox_coords[3]) < 1e-6)
+            end_bbox_defined = not (abs(end_bbox_coords[0]) < 1e-6 and abs(end_bbox_coords[1]) < 1e-6 and \
+                                    abs(end_bbox_coords[2]) < 1e-6 and abs(end_bbox_coords[3]) < 1e-6)
+
+            if start_bbox_defined and end_bbox_defined:
+                interp_bbox_x_min = (1 - t) * start_bbox_coords[0] + t * end_bbox_coords[0]
+                interp_bbox_y_min = (1 - t) * start_bbox_coords[1] + t * end_bbox_coords[1]
+                interp_bbox_x_max = (1 - t) * start_bbox_coords[2] + t * end_bbox_coords[2]
+                interp_bbox_y_max = (1 - t) * start_bbox_coords[3] + t * end_bbox_coords[3]
+                suggested_person.bbox = [interp_bbox_x_min, interp_bbox_y_min, interp_bbox_x_max, interp_bbox_y_max]
+            elif start_bbox_defined: # If only start is defined, carry it forward (or choose other logic)
+                suggested_person.bbox = list(start_bbox_coords)
+            else: # Otherwise, default to an empty bbox for the suggestion
+                suggested_person.bbox = [0.0, 0.0, 0.0, 0.0]
+            # --- End Bounding Box Interpolation ---
 
             # TODO: Implement different interpolation types (currently linear)
             # if interp_type == "Cubic": ...
@@ -398,9 +422,9 @@ class AnnotationHandler(QObject):
             id_for_this_pose = next_ai_id_candidate # Tentative ID for "All Detected" mode
             bbox_for_this_pose = bbox_norm_from_ai
 
-            if target_mode == "All Detected People":
+            if target_mode == "RTMO - frame":
                 should_add_this_ai_pose = True
-            elif target_mode == "Only for Empty User BBoxes" and user_bboxes_for_empty_mode is not None:
+            elif (target_mode == "RTMO - BBoxes" or target_mode == 'ViTPose - BBoxes') and user_bboxes_for_empty_mode is not None:
                 ai_center_x = (bbox_norm_from_ai[0] + bbox_norm_from_ai[2]) / 2
                 ai_center_y = (bbox_norm_from_ai[1] + bbox_norm_from_ai[3]) / 2
                 for user_ann in user_bboxes_for_empty_mode:

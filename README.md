@@ -1,34 +1,30 @@
 # AnnoFrog
-<a href="https://github.com/niklasries/AnnoFrog"> <!-- Optional: Link the image -->
-  <img src="./assets/Annofrog-nobg.png" alt="AnnoFrog Logo" width="200"/> 
-  <!-- Adjust width="200" to your desired pixel width. Height will scale proportionally. -->
-</a>
 
+[![AnnoFrog logo](./assets/Annofrog-nobg.png)](https://github.com/niklasries/AnnoFrog)
 
-A GUI desktop application for semi-automated 2D human pose annotation in videos, using bounding box and keypoint labeling, AI-assisted suggestions (RTMO), and interpolation tools. Built with Python, PyQt6, and OpenGL.
+A GUI desktop application for semi-automated 2D human pose annotation in videos, using bounding box and keypoint labeling, AI-assisted suggestions (PoseViT for detection, RTMO for keypoints), and interpolation tools. Built with Python, PyQt6, and OpenGL.
 
-<a> 
-  <img src="./assets/AnnoFrog-mainUI.png" alt="Main UI" width="800"/> 
-  
-</a>
 ## Features
 
 *   **Video Loading & Frame Navigation:** Load common video formats (MP4, AVI, MOV, MKV) and easily navigate frames using a visual timeline or keyboard shortcuts.
 *   **Bounding Box Annotation:**
-    *   Draw bounding boxes around subjects.
+    *   Manually draw bounding boxes around subjects.
     *   Adjust bounding box corners.
 *   **Keypoint Annotation (14-Point Human Pose):**
     *   Place keypoints for Left/Right Shoulders, Elbows, Wrists, Hips, Knees, Ankles, Head, and Neck.
     *   Mark keypoints as Visible, Occluded.
     *   Visual skeleton rendering.
-*   **AI-Assisted Pose Estimation (RTMO):**
-    *   Utilizes the RTMO model (via `rtmlib`) for automatic pose suggestions.
-    *   Configurable confidence thresholds.
-    *   Modes:
-        *   Suggest poses for all detected people.
-        *   Suggest poses only for user-drawn bounding boxes
+*   **AI-Assisted Annotation:**
+    *   **Bounding Box Detection (PoseViT):**
+        *   Utilizes a PoseViT-based model for pose estimation of a set of BBoxes.
+    *   **Keypoint Pose Estimation (RTMO):**
+        *   Utilizes the RTMO model (via `rtmlib`) for automatic keypoint pose suggestions.
+        *   Configurable confidence thresholds.
+        *   Modes:
+            *   Suggest poses for all detected people.
+            *   Suggest poses only for user-drawn/PoseViT-suggested bounding boxes.
 *   **Interpolation Tools:**
-    *   Generate linear interpolation suggestions for keypoints between manually annotated frames.
+    *   Generate linear interpolation suggestions for keypoints and bounding boxes between manually annotated frames.
     *   Configurable maximum gap for interpolation.
     *   Auto-interpolation mode to fill gaps across all tracks.
     *   Accept or discard individual or all suggestions.
@@ -40,7 +36,7 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
     *   Globally hide/show specific person tracks to reduce clutter.
     *   Delete annotations for specific IDs and frame ranges.
 *   **Interactive Canvas:**
-    *   OpenGL-accelerated rendering for smooth zooming and pannign of the annotation display.
+    *   OpenGL-accelerated rendering for smooth zooming and panning of the annotation display.
     *   Context-sensitive cursors and status messages.
 *   **User Interface:**
     *   Organized layout with dedicated panels for AI, Interpolation, and Deletion tools.
@@ -49,16 +45,18 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
 
 ## Requirements
 
-*   Python 3.9+
+*   Python 3.9+, torch > 2.0
 *   See `requirements.txt` for specific Python package dependencies.
 *   An NVIDIA GPU with CUDA support is highly recommended for AI pose estimation (`rtmlib` with `DEVICE = 'cuda'`). CPU mode is available but will be significantly slower.
-*   Pre-trained RTMO ONNX model (e.g., `RTMO-body7-crowdpose.onnx`). *You need to provide this model.*
+*   Pre-trained AI Models:
+    *   RTMO ONNX model (e.g., `RTMO-body7-crowdpose.onnx`). *You need to provide this model.*
+    *   PoseViT model for bounding box detection. Will auto Download
 
 ## Installation & Setup
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/niklasries/AnnoFrog.git 
+    git clone https://github.com/niklasries/AnnoFrog.git
     cd AnnoFrog
     ```
 
@@ -72,16 +70,19 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
     pip install -r requirements.txt
     ```
 
-4.  **Obtain AI Model:**
-    *   Download or ensure you have an RTMO ONNX model file (e.g., `RTMO-body7-crowdpose.onnx`).
-    *   [RTMO-l](https://download.openmmlab.com/mmpose/v1/projects/rtmo/rtmo-l_16xb16-700e_body7-crowdpose-640x640-5bafdc11_20231219.pth)
-    *   convert to ONNX and place it in /res/models.
+4.  **Obtain AI Models:**
+    *   **RTMO (Keypoints):**
+        *   Download a pre-trained RTMO model (e.g., from [OpenMMLab's RTMO project](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmo)). For example, the `.pth` file for [RTMO-l](https://download.openmmlab.com/mmpose/v1/projects/rtmo/rtmo-l_16xb16-700e_body7-crowdpose-640x640-5bafdc11_20231219.pth).
+        *   Convert the downloaded `.pth` model to ONNX format (e.g., `RTMO-body7-crowdpose.onnx`). Refer to MMPose or RTMLib documentation for conversion scripts.
+        *   Place the converted ONNX model in a directory like `res/models/`.
+    *   **PoseViT (Bounding Boxes):**
+        *   As ViTPose needs bounding boxes, it only works if you give it a suggestion. The Head and Neck Keypoints are not returned as it is N17 COCO, so only 12 of those keypoints get shown.
 
-5.  **Configure Model Path:**
-    *   Open the Window Python script `Window.py`.
-    *   Locate the following line and update the path to your downloaded ONNX model:
+5.  **Configure Model Paths:**
+    *   Open the Python script `Window.py` (or your main application configuration file).
+    *   Locate the following lines and update the paths to your downloaded/converted ONNX models:
         ```python
-        RTMO_CROWDPOSE_MODEL_PATH = '/path/to/your/RTMO-body7-crowdpose.onnx' 
+        RTMO_CROWDPOSE_MODEL_PATH = 'res/models/your_rtmo_model.onnx' # Update this path
         ```
     *   You can also configure the `DEVICE` (e.g., `'cuda'` or `'cpu'`) if needed.
 
@@ -103,9 +104,10 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
         *   **Middle-Click on Keypoint:** Delete the keypoint.
         *   **Q/E Keys:** Cycle to the previous/next keypoint to place.
         *   **Enter Key:** Finalize keypoint placement for the current person and return to Idle mode (person remains selected).
-5.  **AI Pose Estimation:**
-    *   Use the "AI Pose Estimation" panel.
-    *   Click "Run AI on Current Frame (V)" to get suggestions.
+5.  **AI-Assisted Annotation:**
+    *   Use the "AI Tools" panel (or similar name).
+    *   *(You might want to specify how PoseViT is triggered for BBox detection, e.g., a button or automatic on frame load)*
+    *   For RTMO keypoints: Click "Run AI on Current Frame (V)" or similar button to get suggestions.
     *   Adjust confidence and target mode as needed.
     *   AI suggestions appear and can be accepted (e.g., by double-clicking them or via context menu).
 6.  **Interpolation:**
@@ -139,7 +141,7 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
 *   **A:** Previous Frame
 *   **D:** Next Frame
 *   **J:** Jump to Frame
-*   **V:** Run AI Pose Estimation on Current Frame
+*   **V:** Run AI Pose Estimation (RTMO Keypoints) on Current Frame
 *   **Spacebar:** Accept all (interpolated) suggestions on current frame
 *   **Esc:** Enter Idle/Select mode, deselect active person, or cancel current drawing action.
 *   **B:** Toggle "New BBox" mode.
@@ -155,24 +157,19 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
 
 **Known Issues:**
 
-*   **Bounding Box Interpolation:** Interpolation of bounding box corners between keyframes is not currently implemented or fully functional.
-*   **AI Suggestion Display with Existing BBox:** When using the AI "Only for Empty User BBoxes" mode, AI-generated keypoint suggestions might not immediately display or update visually if a user-drawn bounding box already exists for that person ID. Deleting and re-adding the user bbox or toggling the AI mode might be needed as a workaround.
-*   **Tooltip in Keypoint Mode:** After all keypoints for a person are set and the user returns to an "Idle" state with that person selected, the tooltip near the cursor might still display information about the last placed keypoint instead of a general "Idle" or selection message.
 *   **Performance with Long Videos:** Global operations (like global ID changes or initial auto-interpolation on very long videos) might experience performance slowdowns.
+
+**Resolved Issues (Recently Fixed):**
+
+*   ~~**Bounding Box Interpolation:** Interpolation of bounding box corners between keyframes is not currently implemented or fully functional.~~ (Now implemented)
+*   ~~**AI Suggestion Display with Existing BBox:** When using the AI "Only for Empty User BBoxes" mode, AI-generated keypoint suggestions might not immediately display or update visually if a user-drawn bounding box already exists for that person ID. Deleting and re-adding the user bbox or toggling the AI mode might be needed as a workaround.~~ (Fixed)
+*   ~~**Tooltip in Keypoint Mode:** After all keypoints for a person are set and the user returns to an "Idle" state with that person selected, the tooltip near the cursor might still display information about the last placed keypoint instead of a general "Idle" or selection message.~~ (Fixed)
 
 **Future Work:**
 
 *   **VidPredViT Training Data Generation:** The primary goal for this tool is to generate high-quality annotated data for training a custom Video Prediction Vision Transformer (VidPredViT) model, specifically tailored for robust motion tracking and prediction of human poses in video sequences.
-*   **Model Management:** Allow users to select different AI pose estimation models or configure model-specific parameters through the UI.
+*   **Model Management:** Allow users to select different AI pose estimation models or configure model-specific parameters through the UI more easily (e.g., without editing code).
 *   **Batch Processing:** Add capabilities for batch processing videos or running AI/interpolation tasks in the background for multiple files.
-
-
 
 ## License
 
-
-
-## Acknowledgements
-
-*   [RTMO](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmo) for providing the basic pose estimation model
-*   [RTMLib](https://github.com/Tau-J/rtmlib) for the RTMO pose estimation capabilities.

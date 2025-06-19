@@ -19,7 +19,7 @@ class AIPosePanelWidget(QWidget):
         ai_group = QGroupBox("AI Pose Estimation")
         ai_layout = QVBoxLayout()
 
-        self.run_ai_button = QPushButton("Run AI on Current Frame (V)")
+        self.run_ai_button = QPushButton("AI Detect (V)")
         self.run_ai_button.setToolTip("Run AI pose estimation on the currently displayed frame.")
         ai_layout.addWidget(self.run_ai_button)
 
@@ -35,17 +35,29 @@ class AIPosePanelWidget(QWidget):
         ai_layout.addLayout(kp_conf_layout)
 
         # AI Target Mode
-        target_mode_layout = QHBoxLayout()
-        target_mode_layout.addWidget(QLabel("Target Mode:"))
-        self.target_mode_combobox = QComboBox()
-        self.target_mode_combobox.addItems(["All Detected People", "Only for Empty User BBoxes"])
-        self.target_mode_combobox.setToolTip(
-            "'All Detected': Adds all new AI poses.\n"
-            "'Only for Empty User BBoxes': Fills AI poses into user-drawn bboxes that have few keypoints."
+        detection_mode_layout = QHBoxLayout()
+        detection_mode_layout.addWidget(QLabel("Detection Mode:"))
+        self.detection_mode_combobox = QComboBox() 
+        self.detection_mode_combobox.addItems([
+            "RTMO - frame",          # Was "All Detected People"
+            "RTMO - BBoxes", # Was "Only for Empty User BBoxes"
+            "ViTPose - BBoxes"           # New ViTPose mode
+        ])
+        self.detection_mode_combobox.setToolTip(
+            "'RTMO - All Detected': RTMO suggests poses for everyone it finds.\n"
+            "'RTMO - Empty User BBoxes': RTMO fills poses into user-drawn bboxes with few keypoints.\n"
+            "'ViTPose - User BBoxes': ViTPose estimates poses within all valid user-drawn bboxes on the frame."
         )
-        target_mode_layout.addWidget(self.target_mode_combobox)
-        ai_layout.addLayout(target_mode_layout)
+        detection_mode_layout.addWidget(self.detection_mode_combobox)
+        ai_layout.addLayout(detection_mode_layout)
 
         ai_group.setLayout(ai_layout)
         layout.addWidget(ai_group)
         self.setLayout(layout)
+
+    
+    def get_selected_detection_mode(self) -> str:
+        return self.detection_mode_combobox.currentText()
+
+    def get_kp_confidence(self) -> float:
+        return self.kp_confidence_spinbox.value()
