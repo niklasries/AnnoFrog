@@ -113,8 +113,7 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
         *   **Q/E Keys:** Cycle to the previous/next keypoint to place.
         *   **Enter Key:** Finalize keypoint placement for the current person and return to Idle mode (person remains selected).
 5.  **AI-Assisted Annotation:**
-    *   Use the "AI Tools" panel (or similar name).
-    *   *(You might want to specify how PoseViT is triggered for BBox detection, e.g., a button or automatic on frame load)*
+    *   Use the "AI Tools" panel.
     *   For RTMO keypoints: Click "Run AI on Current Frame (V)" or similar button to get suggestions.
     *   Adjust confidence and target mode as needed.
     *   AI suggestions appear and can be accepted (e.g., by double-clicking them or via context menu).
@@ -165,7 +164,7 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
 
 **Known Issues:**
 
-*   **Performance with Long Videos:** Global operations (like global ID changes or initial auto-interpolation on very long videos) might experience performance slowdowns.
+*   **Performance with Long Videos:** Global operations like global ID changes or initial auto-interpolation on very long videos might experience performance slowdowns.
 
 **Resolved Issues (Recently Fixed):**
 
@@ -176,8 +175,6 @@ A GUI desktop application for semi-automated 2D human pose annotation in videos,
 **Future Work:**
 
 *   **VidPredViT Training Data Generation:** The primary goal for this tool is to generate high-quality annotated data for training a custom Video Prediction Vision Transformer (VidPredViT) model, specifically tailored for robust motion tracking and prediction of human poses in video sequences.
-*   **Model Management:** Allow users to select different AI pose estimation models or configure model-specific parameters through the UI more easily (e.g., without editing code).
+*   **Model Management:** Allow users to select different AI pose estimation models or configure model-specific parameters through the UI more easily.
 *   **Batch Processing:** Add capabilities for batch processing videos or running AI/interpolation tasks in the background for multiple files.
-
-## License
 
