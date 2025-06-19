@@ -1,8 +1,16 @@
 # AnnoFrog
 
-[![AnnoFrog logo](./assets/Annofrog-nobg.png)](https://github.com/niklasries/AnnoFrog)
+<a href="https://github.com/niklasries/AnnoFrog"> <!-- Optional: Link the image -->
+  <img src="./assets/Annofrog-nobg.png" alt="AnnoFrog Logo" width="200"/> 
+  
+</a>
 
 A GUI desktop application for semi-automated 2D human pose annotation in videos, using bounding box and keypoint labeling, AI-assisted suggestions (PoseViT for detection, RTMO for keypoints), and interpolation tools. Built with Python, PyQt6, and OpenGL.
+
+<a> 
+  <img src="./assets/AnnoFrog-mainUI.png" alt="Main UI" width="800"/> 
+  
+</a>
 
 ## Features
 
